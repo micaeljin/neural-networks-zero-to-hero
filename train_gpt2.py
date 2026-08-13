@@ -1,3 +1,7 @@
+import os
+import math
+import time
+import inspect
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -172,8 +176,89 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        if master_process:
+            print(f"num decayed parameter tensor: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensor: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        fused_available = 'fused' in inspect.signiture(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+# -------------------------------------------------------------------
+
+import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 
+class DataLoaderLite:
+
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        data_root = 'edu_fineweb10B'
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+
+        assert len(shards) > 0, f'no shards found for split {split}'
+        if master_process:
+            print(f'found {len(shards)} shards for split {split}')
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+
+        self.current_position += B * T * self.num_processes
+
+        if self.current_position + (B * T * self.num_processes) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
+
+        return x, y
+
+
+   
+
+
+
+
+# -------------------------------------------------------------------
 
 device='cpu'
 if torch.cuda.is_available():
