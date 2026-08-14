@@ -260,41 +260,157 @@ class DataLoaderLite:
 
 # -------------------------------------------------------------------
 
-device='cpu'
+
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = 'cpu'
+
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+    print(f'using device: {device}')
+
+device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+
+
+torch.manual_seed(1337)
 if torch.cuda.is_available():
-    device='cuda'
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = 'mps'
-print(f"using device: {device}")
+    torch.cuda.manual_seed(1337)
 
-num_return_sequences = 5
-max_length = 30
+enc = tiktoken.get_encoding("gpt2")
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
+total_batch_size = 524288
+B = 64
+T = 1024
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
+
+torch.set_float32_matmul_precision('high')
+
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+use_compile=False
+if use_compile:
+    torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 715
+max_steps = 19073
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it > max_steps:
+        return min_lr
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
 
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits, loss = model(x)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, xcol), dim=-1)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f'log.txt')
+with open(log_file, 'w') as f:
+    pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# device='cpu'
+# if torch.cuda.is_available():
+#     device='cuda'
+# elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+#     device = 'mps'
+# print(f"using device: {device}")
+
+# num_return_sequences = 5
+# max_length = 30
+
+# model = GPT.from_pretrained('gpt2')
+# model.eval()
+# model.to(device)
+
+# import tiktoken
+# enc = tiktoken.get_encoding('gpt2')
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to(device)
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+
+# while x.size(1) < max_length:
+#     with torch.no_grad():
+#         logits, loss = model(x)
+#         logits = logits[:, -1, :]
+#         probs = F.softmax(logits, dim=-1)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         ix = torch.multinomial(topk_probs, 1)
+#         xcol = torch.gather(topk_indices, -1, ix)
+#         x = torch.cat((x, xcol), dim=-1)
+
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
